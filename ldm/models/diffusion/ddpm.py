@@ -17,6 +17,7 @@ from functools import partial
 from tqdm import tqdm
 from torchvision.utils import make_grid
 from pytorch_lightning.utilities.distributed import rank_zero_only
+from torch import clamp
 
 from ldm.util import log_txt_as_img, exists, default, ismap, isimage, mean_flat, count_params, instantiate_from_config
 from ldm.modules.ema import LitEma
@@ -25,6 +26,7 @@ from ldm.models.autoencoder import VQModelInterface, IdentityFirstStage, Autoenc
 from ldm.modules.diffusionmodules.util import make_beta_schedule, extract_into_tensor, noise_like
 from ldm.models.diffusion.ddim import DDIMSampler
 
+from torchvision.transforms import Resize
 
 __conditioning_keys__ = {'concat': 'c_concat',
                          'crossattn': 'c_crossattn',
@@ -327,12 +329,17 @@ class DDPM(pl.LightningModule):
         return self.p_losses(x, t, *args, **kwargs)
 
     def get_input(self, batch, k):
-        x = batch[k]
+        if k == "polyp":
+            x = batch['image']
+            mask = batch['mask']
+        else:
+            x = batch[k]
         if len(x.shape) == 3:
             x = x[..., None]
         x = rearrange(x, 'b h w c -> b c h w')
         x = x.to(memory_format=torch.contiguous_format).float()
-        return x
+        mask = mask.to(memory_format=torch.contiguous_format).float()
+        return x, mask
 
     def shared_step(self, batch):
         x = self.get_input(batch, self.first_stage_key)
@@ -652,13 +659,16 @@ class LatentDiffusion(DDPM):
 
     @torch.no_grad()
     def get_input(self, batch, k, return_first_stage_outputs=False, force_c_encode=False,
-                  cond_key=None, return_original_cond=False, bs=None):
-        x = super().get_input(batch, k)
+                  cond_key=None, return_original_cond=False, bs=None,get_mask=False):
+        x, mask = super().get_input(batch, k)
         if bs is not None:
             x = x[:bs]
+            mask = mask[:bs]
         x = x.to(self.device)
         encoder_posterior = self.encode_first_stage(x)
         z = self.get_first_stage_encoding(encoder_posterior).detach()
+        mask_resize = Resize([z.shape[-1],z.shape[-1]])(mask)
+        z_new = torch.cat((z,mask_resize),dim=1)
 
         if self.model.conditioning_key is not None:
             if cond_key is None:
@@ -694,12 +704,14 @@ class LatentDiffusion(DDPM):
             if self.use_positional_encodings:
                 pos_x, pos_y = self.compute_latent_shifts(batch)
                 c = {'pos_x': pos_x, 'pos_y': pos_y}
-        out = [z, c]
+        out = [z_new, c]
         if return_first_stage_outputs:
             xrec = self.decode_first_stage(z)
             out.extend([x, xrec])
         if return_original_cond:
             out.append(xc)
+        if get_mask:
+            out.append(mask)
         return out
 
     @torch.no_grad()
@@ -1008,7 +1020,7 @@ class LatentDiffusion(DDPM):
         qt_mean, _, qt_log_variance = self.q_mean_variance(x_start, t)
         kl_prior = normal_kl(mean1=qt_mean, logvar1=qt_log_variance, mean2=0.0, logvar2=0.0)
         return mean_flat(kl_prior) / np.log(2.0)
-
+    
     def p_losses(self, x_start, cond, t, noise=None):
         noise = default(noise, lambda: torch.randn_like(x_start))
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
@@ -1023,8 +1035,24 @@ class LatentDiffusion(DDPM):
             target = noise
         else:
             raise NotImplementedError()
+        
+        # add the loss for the mask
+        mask_noisy = x_noisy[:,-1, :, :]
+        mask = x_start[:,-1, :, :]
+        mask_noise = model_output[:,-1, :, :]
+        
+        predictive_mask = self.predict_start_from_noise(mask_noisy, t, mask_noise)
+        #replace negative values with 0, >1 with 1
+        predictive_mask = torch.clamp(predictive_mask, 0, 1)
 
         loss_simple = self.get_loss(model_output, target, mean=False).mean([1, 2, 3])
+        
+        #get the cross entropy loss for the mask
+        loss_fn = nn.BCELoss()
+        loss_anchor = loss_fn(predictive_mask, mask)
+        
+        loss_simple = loss_simple + loss_anchor
+        
         loss_dict.update({f'{prefix}/loss_simple': loss_simple.mean()})
 
         logvar_t = self.logvar[t].to(self.device)
@@ -1086,8 +1114,9 @@ class LatentDiffusion(DDPM):
                                        return_x0=return_x0,
                                        score_corrector=score_corrector, corrector_kwargs=corrector_kwargs)
         if return_codebook_ids:
-            raise DeprecationWarning("Support dropped.")
             model_mean, _, model_log_variance, logits = outputs
+            raise DeprecationWarning("Support dropped.")
+            
         elif return_x0:
             model_mean, _, model_log_variance, x0 = outputs
         else:
@@ -1249,21 +1278,22 @@ class LatentDiffusion(DDPM):
 
     @torch.no_grad()
     def log_images(self, batch, N=8, n_row=4, sample=True, ddim_steps=200, ddim_eta=1., return_keys=None,
-                   quantize_denoised=True, inpaint=True, plot_denoise_rows=False, plot_progressive_rows=True,
+                   quantize_denoised=True, inpaint=False, plot_denoise_rows=False, plot_progressive_rows=False,
                    plot_diffusion_rows=True, **kwargs):
 
         use_ddim = ddim_steps is not None
 
         log = dict()
-        z, c, x, xrec, xc = self.get_input(batch, self.first_stage_key,
+        z, c, x, xrec, xc, mask = self.get_input(batch, self.first_stage_key,
                                            return_first_stage_outputs=True,
                                            force_c_encode=True,
                                            return_original_cond=True,
-                                           bs=N)
+                                           bs=N,get_mask=True)
         N = min(x.shape[0], N)
         n_row = min(x.shape[0], n_row)
         log["inputs"] = x
         log["reconstruction"] = xrec
+        log["mask"] = mask
         if self.model.conditioning_key is not None:
             if hasattr(self.cond_stage_model, "decode"):
                 xc = self.cond_stage_model.decode(c)
@@ -1303,8 +1333,16 @@ class LatentDiffusion(DDPM):
                 samples, z_denoise_row = self.sample_log(cond=c,batch_size=N,ddim=use_ddim,
                                                          ddim_steps=ddim_steps,eta=ddim_eta)
                 # samples, z_denoise_row = self.sample(cond=c, batch_size=N, return_intermediates=True)
+            #take the first 4 channel of the samples
+            pred_mask = samples[:,-1,:,:]
+            pred_mask = clamp(pred_mask,0,1)
+            
+            samples = samples[:,:4,:,:]
             x_samples = self.decode_first_stage(samples)
+            
             log["samples"] = x_samples
+            log["pred_mask"] = pred_mask
+            
             if plot_denoise_rows:
                 denoise_grid = self._get_denoise_row_from_list(z_denoise_row)
                 log["denoise_row"] = denoise_grid
