@@ -1,5 +1,5 @@
 model:
-  base_learning_rate: 1.0e-04
+  base_learning_rate: 1.0e-05
   target: ldm.models.diffusion.ddpm.LatentDiffusion
   params:
     linear_start: 0.00085
@@ -13,7 +13,7 @@ model:
     monitor: val/loss_simple_ema
     scale_factor: 0.18215
     use_ema: False
-
+    # ckpt_path: /home/majiajian/code/diffusion/pretrain_model/v1-5-pruned.ckpt
     scheduler_config: # 10000 warmup steps
       target: ldm.lr_scheduler.LambdaLinearScheduler
       params:
@@ -34,15 +34,14 @@ model:
         num_res_blocks: 2
         channel_mult: [ 1, 2, 4, 4 ]
         num_heads: 8
-        use_spatial_transformer: True
         transformer_depth: 1
-        context_dim: 768
         use_checkpoint: True
         legacy: False
 
     first_stage_config:
       target: ldm.models.autoencoder.AutoencoderKL
       params:
+        #ckpt_path: /home/majiajian/code/diffusion/pretrain_model/v1-5-pruned.ckpt
         embed_dim: 4
         monitor: val/rec_loss
         ddconfig:
@@ -66,7 +65,7 @@ model:
 data:
   target: main.DataModuleFromConfig
   params:
-      batch_size: 32
+      batch_size: 4
       wrap: False
       train:
           target: ldm.data.polypdata.PolypDataset

@@ -309,7 +309,7 @@ class AttentionBlock(nn.Module):
             # split heads before split qkv
             self.attention = QKVAttentionLegacy(self.num_heads)
 
-        self.proj_out = zero_module(conv_nd(1, channels, channels, 1))
+        self.proj_out = zero_module(conv_nd(2, channels, channels, 1))
 
     def forward(self, x):
         return checkpoint(self._forward, (x,), self.parameters(), True)   # TODO: check checkpoint usage, is True # TODO: fix the .half call!!!
@@ -320,7 +320,10 @@ class AttentionBlock(nn.Module):
         x = x.reshape(b, c, -1)
         qkv = self.qkv(self.norm(x))
         h = self.attention(qkv)
+        #if the dim of h is 3, then we need to reshape it to 4
+        h = h.unsqueeze(-1) if len(h.shape) == 3 else h
         h = self.proj_out(h)
+        h = h.squeeze(-1) if len(h.shape) == 4 else h
         return (x + h).reshape(b, c, *spatial)
 
 

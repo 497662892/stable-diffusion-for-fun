@@ -336,7 +336,7 @@ class DDPM(pl.LightningModule):
             x = batch[k]
         if len(x.shape) == 3:
             x = x[..., None]
-        x = rearrange(x, 'b h w c -> b c h w')
+        # x = rearrange(x, 'b h w c -> b c h w')
         x = x.to(memory_format=torch.contiguous_format).float()
         mask = mask.to(memory_format=torch.contiguous_format).float()
         return x, mask
@@ -665,6 +665,8 @@ class LatentDiffusion(DDPM):
             x = x[:bs]
             mask = mask[:bs]
         x = x.to(self.device)
+        mask = mask.to(self.device)
+        
         encoder_posterior = self.encode_first_stage(x)
         z = self.get_first_stage_encoding(encoder_posterior).detach()
         mask_resize = Resize([z.shape[-1],z.shape[-1]])(mask)
@@ -1041,16 +1043,20 @@ class LatentDiffusion(DDPM):
         mask = x_start[:,-1, :, :]
         mask_noise = model_output[:,-1, :, :]
         
-        predictive_mask = self.predict_start_from_noise(mask_noisy, t, mask_noise)
-        #replace negative values with 0, >1 with 1
-        predictive_mask = torch.clamp(predictive_mask, 0, 1)
+        # if t <= 200:
+        #     predictive_mask = self.predict_start_from_noise(mask_noisy, t, mask_noise)
+        #     #replace negative values with 0, >1 with 1
+        #     predictive_mask = torch.clamp(predictive_mask, 0, 1)
 
+        
+            
+        #     #get the cross entropy loss for the mask
+        #     loss_fn = nn.BCELoss()
+        #     loss_anchor = loss_fn(predictive_mask, mask)
+            
+        # else:
+        loss_anchor = 0
         loss_simple = self.get_loss(model_output, target, mean=False).mean([1, 2, 3])
-        
-        #get the cross entropy loss for the mask
-        loss_fn = nn.BCELoss()
-        loss_anchor = loss_fn(predictive_mask, mask)
-        
         loss_simple = loss_simple + loss_anchor
         
         loss_dict.update({f'{prefix}/loss_simple': loss_simple.mean()})
@@ -1279,7 +1285,7 @@ class LatentDiffusion(DDPM):
     @torch.no_grad()
     def log_images(self, batch, N=8, n_row=4, sample=True, ddim_steps=200, ddim_eta=1., return_keys=None,
                    quantize_denoised=True, inpaint=False, plot_denoise_rows=False, plot_progressive_rows=False,
-                   plot_diffusion_rows=True, **kwargs):
+                   plot_diffusion_rows=False, **kwargs):
 
         use_ddim = ddim_steps is not None
 
@@ -1319,6 +1325,7 @@ class LatentDiffusion(DDPM):
                     t = t.to(self.device).long()
                     noise = torch.randn_like(z_start)
                     z_noisy = self.q_sample(x_start=z_start, t=t, noise=noise)
+                    z_noisy = z_noisy[:,:4,:,:]
                     diffusion_row.append(self.decode_first_stage(z_noisy))
 
             diffusion_row = torch.stack(diffusion_row)  # n_log_step, n_row, C, H, W
@@ -1333,9 +1340,12 @@ class LatentDiffusion(DDPM):
                 samples, z_denoise_row = self.sample_log(cond=c,batch_size=N,ddim=use_ddim,
                                                          ddim_steps=ddim_steps,eta=ddim_eta)
                 # samples, z_denoise_row = self.sample(cond=c, batch_size=N, return_intermediates=True)
+            
             #take the first 4 channel of the samples
-            pred_mask = samples[:,-1,:,:]
+            pred_mask = samples[:,-1:,:,:]
+            pred_mask = Resize((x.shape[2],x.shape[3]))(pred_mask)
             pred_mask = clamp(pred_mask,0,1)
+            
             
             samples = samples[:,:4,:,:]
             x_samples = self.decode_first_stage(samples)
